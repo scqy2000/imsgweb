@@ -10,6 +10,7 @@
   import { cleanText } from "../../server/preview";
   import { bubbleTime } from "../format";
   import { store } from "../store.svelte";
+  import MessageActions from "./MessageActions.svelte";
 
   const {
     message,
@@ -40,10 +41,13 @@
 </script>
 
 <div
-  class={`mb-1 flex ${message.is_from_me ? "justify-end" : "justify-start"}`}
+  class={`group mb-2 flex ${message.is_from_me ? "justify-end" : "justify-start"}`}
   data-guid={message.guid}
 >
-  <div class="max-w-[70%]">
+  <div class="min-w-0 max-w-[85%] sm:max-w-[70%]">
+    <div class="flex items-center justify-between gap-2 text-xs text-gray-400">
+      <span>{bubbleTime(message.created_at)}</span><MessageActions {message} />
+    </div>
     {#if isGroup && !message.is_from_me}
       <div class="mb-0.5 ml-2 text-xs text-gray-500">
         {message.sender_name ?? message.sender}
@@ -85,6 +89,32 @@
                   <span class="tabular-nums opacity-70">
                     {voteCount(option.id)}
                   </span>
+                  <button
+                    class="rounded border border-current/20 px-2 py-1 disabled:opacity-40"
+                    disabled={!store.supports("poll.vote") ||
+                      store.mutationBusy ||
+                      !!store.uncertainty}
+                    title={store.capabilityReason("poll.vote") || "投票"}
+                    onclick={() =>
+                      void store.runAction("poll.vote", {
+                        chat_id: message.chat_id,
+                        poll_guid: message.poll?.poll_guid ?? message.guid,
+                        option_id: option.id,
+                      })}>投票</button
+                  >
+                  <button
+                    class="rounded border border-current/20 px-2 py-1 disabled:opacity-40"
+                    disabled={!store.supports("poll.unvote") ||
+                      store.mutationBusy ||
+                      !!store.uncertainty}
+                    title={store.capabilityReason("poll.unvote") || "取消投票"}
+                    onclick={() =>
+                      void store.runAction("poll.unvote", {
+                        chat_id: message.chat_id,
+                        poll_guid: message.poll?.poll_guid ?? message.guid,
+                        option_id: option.id,
+                      })}>取消</button
+                  >
                 </li>
               {/each}
             </ul>
@@ -96,7 +126,7 @@
           {/if}
         </div>
       {/if}
-      {#each message.attachments as attachment (attachment.url)}
+      {#each message.attachments as attachment, attachmentIndex (attachmentIndex)}
         {#if attachment.missing || !attachment.url}
           <div
             class="my-1 flex items-center gap-1.5 rounded bg-black/10 px-2 py-1 text-xs italic"

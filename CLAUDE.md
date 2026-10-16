@@ -1,5 +1,13 @@
 # imsgweb
 
+## Repository Ownership
+
+This is the independently maintained `scqy2000/imsgweb` repository. The only
+development and release destination is `https://github.com/scqy2000/imsgweb`.
+Use `origin/main` as the integration branch. Never push to, open pull requests
+against, or automatically synchronize `PeronGH/imsgweb`. Retain original license
+and attribution. The `imsg/` reference submodule remains a separate dependency.
+
 Full-stack Bun app that compiles to a single binary (`dist/imsgweb`).
 Svelte 5 SPA in `web/`, Hono + Zod API in `server/`, end-to-end typed via Hono RPC.
 No Vite, no Node.js — Bun bundles everything, including the frontend.
@@ -29,18 +37,18 @@ GitHub release. Runs are serialized via a concurrency group.
   with `zValidator` from `@hono/zod-validator`. Routes MUST stay in the chained
   style (`new Hono().get(...).post(...)`) — `export type AppType` powers the
   RPC client, and standalone `app.get(...)` calls break type inference.
-  Endpoints expose only imsg's SIP-on surface; live updates are SSE
+  Endpoints expose SIP-on features plus capability-gated bridge operations; live updates are SSE
   (`/api/events`, resume via Last-Event-ID = message rowid), never WebSocket.
   The server is stateless: imsg is the source of truth, aggregation happens
   per request. Helpers: `server/payloads.ts` (RPC → frontend shapes),
   `server/attachments.ts` (path-validated, browser-cacheable file serving),
   `server/auth.ts` (optional IMSGWEB_PASSWORD gate — a cookie, not a
   header, because EventSource can't send headers).
-- `web/api.ts` — typed client: `hc<AppType>(...)`. Frontend calls the API only
-  through this client; its fetch wrapper is the single 401 interceptor
-  that swaps the app for the login screen.
+- `web/api.ts` — typed login client: `hc<AppType>(...)`. Feature calls use
+  `web/service.ts` for JSON/form requests and structured delivery errors.
+  Both wrappers share auth state and intercept 401s to show the login screen.
 - `server/rpc/` — client for the imsg binary (the `imsg/` submodule, pinned
-  v0.11.1). Spawns `imsg rpc` from PATH and speaks JSON-RPC 2.0 over NDJSON
+  v0.17.0). Spawns `imsg rpc` from PATH and speaks JSON-RPC 2.0 over NDJSON
   stdio. `rpc.call(...)` is typed via the method map in `server/rpc/types.ts`
   (hand-written wire types — keep in sync when bumping the submodule);
   `rpc.watch(...)` returns an async-iterable message stream.

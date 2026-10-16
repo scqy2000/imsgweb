@@ -23,12 +23,38 @@ export class RpcError extends Error {
   readonly code: RpcErrorCode;
   /** imsg's fixed per-code label, e.g. "Invalid params". */
   readonly label: string;
+  readonly data: RpcErrorObject["data"];
+  readonly retry_safe: boolean | undefined;
+  readonly disposition: string | undefined;
+  readonly detail: string | undefined;
 
   constructor(error: RpcErrorObject) {
     // imsg puts the human-readable detail in `data`, not `message`
-    super(error.data ?? error.message);
+    super(
+      typeof error.data === "string"
+        ? error.data
+        : (error.data?.detail ?? error.message),
+    );
     this.code = error.code;
     this.label = error.message;
+    this.data = error.data;
+    this.retry_safe =
+      typeof error.data === "object" ? error.data.retry_safe : undefined;
+    this.disposition =
+      typeof error.data === "object" ? error.data.disposition : undefined;
+    this.detail =
+      typeof error.data === "object" ? error.data.detail : undefined;
+  }
+}
+
+export class WatchOverflowError extends Error {
+  override name = "WatchOverflowError";
+  readonly resume_after_rowid: number;
+  readonly reason: string;
+  constructor(cursor: number, reason = "buffer_limit_exceeded") {
+    super(`watch overflow; resume after ROWID ${cursor}`);
+    this.resume_after_rowid = cursor;
+    this.reason = reason;
   }
 }
 
@@ -76,7 +102,11 @@ interface WireMessage {
   params?: {
     subscription: number;
     message?: MessagePayload;
-    error?: { message: string };
+    error?:
+      | { message: string; code?: RpcErrorCode; data?: RpcErrorObject["data"] }
+      | string;
+    resume_after_rowid?: number;
+    reason?: string;
   };
   result?: unknown;
   error?: RpcErrorObject;
@@ -163,12 +193,19 @@ export class RpcClient {
   }
 
   async watch(params: WatchSubscribeParams = {}): Promise<Watch> {
-    const { subscription } = await this.call("watch.subscribe", params);
+    const bufferLimit = params.buffer_limit ?? 256;
+    if (!Number.isInteger(bufferLimit) || bufferLimit < 1 || bufferLimit > 4096)
+      throw new RangeError("buffer_limit must be 1...4096");
+    const { subscription } = await this.call("watch.subscribe", {
+      ...params,
+      buffer_limit: bufferLimit,
+    });
 
     const queue: MessagePayload[] = [];
     let failure: Error | null = null;
     let done = false;
     let wake: (() => void) | null = null;
+    let delivered = Math.max(0, params.since_rowid ?? 0);
     const signal = () => {
       wake?.();
       wake = null;
@@ -176,6 +213,20 @@ export class RpcClient {
 
     this.#watches.set(subscription, {
       push: (message) => {
+        if (done) return;
+        if (queue.length >= bufferLimit) {
+          failure = new WatchOverflowError(
+            queue.at(-1)?.id ?? delivered,
+            "client_buffer_limit_exceeded",
+          );
+          done = true;
+          this.#watches.delete(subscription);
+          void this.call("watch.unsubscribe", { subscription }).catch(
+            () => undefined,
+          );
+          signal();
+          return;
+        }
         queue.push(message);
         signal();
       },
@@ -199,6 +250,7 @@ export class RpcClient {
         for (;;) {
           const next = queue.shift();
           if (next) {
+            delivered = next.id;
             yield next;
             continue;
           }
@@ -287,11 +339,22 @@ export class RpcClient {
     if (!watch) return;
     if (msg.method === "message" && params.message) {
       watch.push(params.message);
-    } else if (msg.method === "error") {
+    } else if (msg.method === "watch.overflow") {
+      this.#watches.delete(params.subscription);
+      watch.finish(
+        new WatchOverflowError(params.resume_after_rowid ?? 0, params.reason),
+      );
+    } else if (msg.method === "error" || msg.method === "watch.error") {
       // the subscription is dead server-side; the consumer must resubscribe
       this.#watches.delete(params.subscription);
       watch.finish(
-        new Error(params.error?.message ?? "watch subscription failed"),
+        typeof params.error === "object" && params.error.code !== undefined
+          ? new RpcError({ ...params.error, code: params.error.code })
+          : new Error(
+              typeof params.error === "string"
+                ? params.error
+                : (params.error?.message ?? "watch subscription failed"),
+            ),
       );
     }
   }

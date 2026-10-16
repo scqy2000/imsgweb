@@ -2,8 +2,6 @@ import { zValidator } from "@hono/zod-validator";
 import { Hono } from "hono";
 import { setCookie } from "hono/cookie";
 import { streamSSE } from "hono/streaming";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
 import { z } from "zod";
 import {
   ATTACHMENT_STORES,
@@ -18,36 +16,108 @@ import {
   requireAuth,
 } from "./auth";
 import { toApiChat, toApiMessage } from "./payloads";
-import { rpc, RpcError, RpcErrorCode, RpcExitError } from "./rpc";
+import {
+  rpc,
+  RpcError,
+  RpcErrorCode,
+  RpcExitError,
+  WatchOverflowError,
+} from "./rpc";
+import {
+  actionEnvelope,
+  invalidParams,
+  performAction,
+  requireMethods,
+} from "./actions";
+import {
+  mapBounded,
+  PaginationFallbackError,
+  scanNewest,
+  scheduledToApi,
+  searchMessages,
+  timestampRowidPage,
+} from "./reads";
+import { parseUploadForm, sendMessage, withStagedUpload } from "./sends";
 
 const limitSchema = z.coerce.number().int().min(1).max(200).default(50);
 
-const sendForm = z
-  .object({
-    to: z.string().min(1).optional(),
-    chat_id: z.coerce.number().int().positive().optional(),
-    text: z.string().optional(),
-    file: z.instanceof(File).optional(),
-  })
-  .refine((form) => (form.to === undefined) !== (form.chat_id === undefined), {
-    message: "provide exactly one of to or chat_id",
-  })
-  .refine((form) => Boolean(form.text?.trim()) || form.file !== undefined, {
-    message: "provide text and/or file",
-  });
+const chatIdSchema = z.object({
+  chatId: z.coerce.number().int().positive().max(Number.MAX_SAFE_INTEGER),
+});
+const optionalChat = z.coerce
+  .number()
+  .int()
+  .positive()
+  .max(Number.MAX_SAFE_INTEGER)
+  .optional();
+const rowid = z.coerce.number().int().positive().max(Number.MAX_SAFE_INTEGER);
 
 const app = new Hono()
   .basePath("/api")
   .onError((error, c) => {
     if (error instanceof RpcError) {
-      const status = error.code === RpcErrorCode.InvalidParams ? 400 : 502;
-      return c.json({ error: error.message }, status);
+      const status =
+        error.code === RpcErrorCode.InvalidParams
+          ? 400
+          : error.code === RpcErrorCode.BridgeUnavailable ||
+              error.code === RpcErrorCode.DatabaseUnavailable
+            ? 503
+            : 502;
+      const mutation = c.req.method === "POST" && c.req.path !== "/api/auth";
+      const certainty =
+        typeof error.data === "object"
+          ? error.data
+          : mutation
+            ? error.code === RpcErrorCode.InvalidParams ||
+              error.code === RpcErrorCode.BridgeUnavailable ||
+              error.code === RpcErrorCode.DatabaseUnavailable
+              ? { retry_safe: true, disposition: "not_started" as const }
+              : {
+                  retry_safe: false,
+                  disposition: "may_have_completed" as const,
+                }
+            : {};
+      return c.json(
+        {
+          error: error.message,
+          code: error.code,
+          label: error.label,
+          data: error.data,
+          ...certainty,
+          ...(error instanceof PaginationFallbackError
+            ? { pagination_fallback: true }
+            : {}),
+        },
+        status,
+      );
     }
     if (error instanceof RpcExitError) {
-      return c.json({ error: error.message }, 502);
+      return c.json(
+        {
+          error: error.message,
+          retry_safe: false,
+          disposition: "may_have_completed",
+          detail:
+            "RPC process exited; any admitted mutation may have executed. Do not retry automatically.",
+        },
+        502,
+      );
     }
     console.error(error);
-    return c.json({ error: "internal error" }, 500);
+    return c.json(
+      {
+        error: "internal error",
+        ...(c.req.method === "POST" && c.req.path !== "/api/auth"
+          ? {
+              retry_safe: false,
+              disposition: "may_have_completed",
+              detail:
+                "The server could not establish whether the mutation executed. Do not retry automatically.",
+            }
+          : {}),
+      },
+      500,
+    );
   })
   .use(requireAuth)
 
@@ -73,24 +143,118 @@ const app = new Hono()
 
   .get("/health", (c) => c.json({ status: "ok" as const }))
 
+  .get("/status", async (c) => c.json(await rpc.call("status")))
+  .get(
+    "/search",
+    zValidator(
+      "query",
+      z.object({
+        query: z.string().trim().min(1).max(16384),
+        chat_id: optionalChat,
+        limit: z.coerce.number().int().min(1).max(100).default(50),
+        before: rowid.optional(),
+      }),
+    ),
+    async (c) => {
+      const { query, chat_id, limit, before } = c.req.valid("query");
+      return c.json(await searchMessages(query, chat_id, limit, before));
+    },
+  )
+  .get(
+    "/stats",
+    zValidator("query", z.object({ chat_id: optionalChat })),
+    async (c) => {
+      await requireMethods(["messages.stats"]);
+      return c.json(await rpc.call("messages.stats", c.req.valid("query")));
+    },
+  )
+  .get(
+    "/scheduled",
+    zValidator(
+      "query",
+      z.object({
+        chat_id: optionalChat,
+        limit: z.coerce.number().int().min(1).max(5000).default(50),
+      }),
+    ),
+    async (c) => {
+      const { chat_id, limit } = c.req.valid("query");
+      await requireMethods(["messages.scheduled"]);
+      // Upstream has no chat filter or cursor; saturation must remain visible.
+      const rpcLimit = chat_id === undefined ? limit : 5000;
+      const result = await rpc.call("messages.scheduled", { limit: rpcLimit });
+      return c.json({
+        messages: result.messages
+          .filter((m) => chat_id === undefined || m.chat_id === chat_id)
+          .slice(0, limit)
+          .map(scheduledToApi),
+        truncated: result.messages.length === rpcLimit,
+      });
+    },
+  )
+  .get("/chats/:chatId/info", zValidator("param", chatIdSchema), async (c) => {
+    await requireMethods(["chats.get"]);
+    return c.json(
+      await rpc.call("chats.get", { chat_id: c.req.valid("param").chatId }),
+    );
+  })
+  .post("/actions", zValidator("json", actionEnvelope), async (c) =>
+    c.json(await performAction(c.req.valid("json"))),
+  )
+  .post("/chats/:chatId/icon", zValidator("param", chatIdSchema), async (c) => {
+    const data = z
+      .object({
+        file: z.instanceof(File).optional(),
+        clear: z.enum(["true", "false"]).optional(),
+        confirmed: z.enum(["true", "false"]).optional(),
+      })
+      .strict()
+      .safeParse(parseUploadForm(await c.req.formData()));
+    if (!data.success) invalidParams(data.error.message);
+    const { file, clear, confirmed } = data.data;
+    if ((file !== undefined) === (clear === "true"))
+      invalidParams("provide file or clear=true, exclusively");
+    if (clear === "true" && confirmed !== "true")
+      invalidParams("explicit confirmation required to clear icon");
+    if (file && !/^image\/(png|jpeg|gif|webp|heic|heif)$/.test(file.type))
+      invalidParams("group icon must be an image upload");
+    await requireMethods(["group.setIcon"]);
+    return c.json(
+      await withStagedUpload(file, (path) =>
+        rpc.call("group.setIcon", {
+          chat_id: c.req.valid("param").chatId,
+          file: path,
+        }),
+      ),
+    );
+  })
+
   // Chat list, aggregated with a last-message preview per chat. The point
   // queries pipeline through the single rpc child (local SQLite) — cheap.
   .get(
     "/chats",
-    zValidator("query", z.object({ limit: limitSchema })),
+    zValidator(
+      "query",
+      z.object({
+        limit: z.coerce.number().int().min(1).max(5000).default(50),
+        unread_only: z
+          .enum(["true", "false"])
+          .transform((s) => s === "true")
+          .default(false),
+      }),
+    ),
     async (c) => {
-      const { limit } = c.req.valid("query");
-      const { chats } = await rpc.call("chats.list", { limit });
-      const previews = await Promise.all(
-        chats.map((chat) =>
-          // attachments give the preview a label when the text is
-          // placeholder-only ("Image", "Sticker", …)
-          rpc.call("messages.history", {
-            chat_id: chat.id,
-            limit: 1,
-            attachments: true,
-          }),
-        ),
+      const { limit, unread_only } = c.req.valid("query");
+      await requireMethods(["chats.list", "messages.history"]);
+      const { chats } = await rpc.call("chats.list", { limit, unread_only });
+      const previews = await mapBounded(chats, (chat) =>
+        // attachments give the preview a label when the text is
+        // placeholder-only ("Image", "Sticker", …)
+        rpc.call("messages.history", {
+          chat_id: chat.id,
+          limit: 1,
+          attachments: true,
+        }),
       );
       return c.json({
         chats: chats.map((chat, i) =>
@@ -100,33 +264,55 @@ const app = new Hono()
     },
   )
 
-  // History page, normalized to oldest→newest. imsg returns newest-first
-  // (docs/rpc.md claims the opposite; the handler never reverses its
-  // date-DESC query) and its `end` bound is exclusive (m.date < end), so
-  // next_before = oldest created_at pages without duplicates.
+  // Timestamp history retains its exclusive `end` bound. ROWID pagination
+  // uses the separate, bounded forward-scan adapter, never a bogus RPC key.
   .get(
     "/chats/:chatId/messages",
-    zValidator(
-      "param",
-      z.object({ chatId: z.coerce.number().int().positive() }),
-    ),
+    zValidator("param", chatIdSchema),
     zValidator(
       "query",
-      z.object({ limit: limitSchema, before: z.iso.datetime().optional() }),
+      z.object({
+        limit: limitSchema,
+        before: z.iso.datetime({ offset: true }).optional(),
+        before_rowid: rowid.optional(),
+      }),
     ),
     async (c) => {
       const { chatId } = c.req.valid("param");
-      const { limit, before } = c.req.valid("query");
-      const { messages } = await rpc.call("messages.history", {
-        chat_id: chatId,
-        limit,
-        end: before,
-        attachments: true,
-        convert_attachments: true,
-      });
+      const { limit, before, before_rowid } = c.req.valid("query");
+      await requireMethods(["messages.history"]);
+      const { messages } =
+        before_rowid !== undefined && before !== undefined
+          ? {
+              messages: await timestampRowidPage(
+                chatId,
+                limit,
+                before,
+                before_rowid,
+              ),
+            }
+          : before_rowid !== undefined
+            ? {
+                messages: await scanNewest(
+                  limit,
+                  chatId,
+                  before_rowid,
+                  () => true,
+                  true,
+                ),
+              }
+            : await rpc.call("messages.history", {
+                chat_id: chatId,
+                limit,
+                end: before,
+                attachments: true,
+                convert_attachments: true,
+              });
       const ordered = [...messages].sort((a, b) => a.id - b.id);
       return c.json({
         messages: ordered.map(toApiMessage),
+        next_before_rowid:
+          messages.length === limit ? (ordered[0]?.id ?? null) : null,
         next_before:
           messages.length === limit ? (ordered[0]?.created_at ?? null) : null,
       });
@@ -143,10 +329,15 @@ const app = new Hono()
       z.object({ since: z.coerce.number().int().nonnegative().optional() }),
     ),
     (c) => {
-      const lastEventId = Number(c.req.header("last-event-id"));
-      const since = Number.isFinite(lastEventId)
-        ? lastEventId
-        : c.req.valid("query").since;
+      const header = c.req.header("last-event-id");
+      const lastEventId =
+        header !== undefined && /^\d+$/.test(header)
+          ? Number(header)
+          : undefined;
+      const since =
+        lastEventId !== undefined && Number.isSafeInteger(lastEventId)
+          ? lastEventId
+          : c.req.valid("query").since;
       return streamSSE(
         c,
         async (stream) => {
@@ -158,6 +349,7 @@ const app = new Hono()
             attachments: true,
             convert_attachments: true,
             include_reactions: true,
+            buffer_limit: 256,
           });
           stream.onAbort(() => void watch.unsubscribe());
           const heartbeat = setInterval(
@@ -172,8 +364,32 @@ const app = new Hono()
                 data: JSON.stringify(toApiMessage(message)),
               });
             }
+          } catch (error) {
+            if (error instanceof WatchOverflowError) {
+              await stream.writeSSE({
+                event: "watch.overflow",
+                id: String(error.resume_after_rowid),
+                data: JSON.stringify({
+                  resume_after_rowid: error.resume_after_rowid,
+                  terminal: true,
+                  reason: error.reason,
+                }),
+              });
+            } else {
+              await stream.writeSSE({
+                event: "error",
+                data: JSON.stringify({
+                  error:
+                    error instanceof Error ? error.message : "watch failed",
+                  ...(error instanceof RpcError
+                    ? { code: error.code, data: error.data }
+                    : {}),
+                }),
+              });
+            }
           } finally {
             clearInterval(heartbeat);
+            await watch.unsubscribe();
           }
         },
         // Watch death lands here; closing the stream makes EventSource
@@ -188,31 +404,9 @@ const app = new Hono()
 
   // Send text and/or a file. Uploads are staged to a temp file only for the
   // lifetime of the request — imsg's send API takes a local path.
-  .post("/messages", zValidator("form", sendForm), async (c) => {
-    const { to, chat_id, text, file } = c.req.valid("form");
-    let staged: string | undefined;
-    try {
-      if (file) {
-        staged = join(
-          tmpdir(),
-          `imsgweb-${crypto.randomUUID()}-${file.name.replaceAll("/", "_")}`,
-        );
-        await Bun.write(staged, file);
-      }
-      const params = { text, file: staged, service: "auto" as const };
-      const result =
-        to !== undefined
-          ? await rpc.call("send", { to, ...params })
-          : await rpc.call("send", { chat_id, ...params });
-      return c.json(result);
-    } finally {
-      if (staged !== undefined) {
-        await Bun.file(staged)
-          .delete()
-          .catch(() => undefined);
-      }
-    }
-  })
+  .post("/messages", async (c) =>
+    c.json(await sendMessage(await c.req.formData())),
+  )
 
   // Delivery status point query — frontend polls this after a send.
   .get("/messages/:guid/status", async (c) =>

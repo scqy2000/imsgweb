@@ -24,6 +24,8 @@ import type {
   SendResult,
 } from "./types";
 import { RpcErrorCode } from "./types";
+import { actionSchemas } from "../actions";
+import { z } from "zod";
 
 const DOOMED_CHAT_ID = 999;
 
@@ -63,6 +65,7 @@ const chats: ChatPayload[] = [
     participants: ["+15551234567"],
     is_group: false,
     contact_name: "Ada Lovelace",
+    unread_count: 1,
   },
   {
     id: 2,
@@ -73,6 +76,7 @@ const chats: ChatPayload[] = [
     last_message_at: "2026-06-10T00:00:03.000Z",
     participants: ["+15551234567", "+15557654321"],
     is_group: true,
+    unread_count: 2,
   },
   {
     // a 1:1 chat whose display_name is "" in chat.db and whose handle the
@@ -117,6 +121,29 @@ const messages: MessagePayload[] = [
   fixture(901, DOOMED_CHAT_ID, "doomed one"),
   fixture(902, DOOMED_CHAT_ID, "doomed two"),
 ];
+messages[0]!.is_read = false;
+if (process.argv.includes("--same-timestamp"))
+  messages[0]!.created_at = messages[1]!.created_at;
+messages[2]!.poll = {
+  kind: "created",
+  event: "imessage.poll.created",
+  poll_guid: "MOCK-103",
+  question: "Dinner?",
+  options: [
+    { id: "opt-1", text: "Pizza" },
+    { id: "opt-2", text: "Sushi" },
+  ],
+};
+messages[2]!.reactions = [
+  {
+    id: 105,
+    type: "love",
+    emoji: "",
+    sender: "+15551234567",
+    is_from_me: false,
+    created_at: "2026-06-10T00:00:05.000Z",
+  },
+];
 let nextRowid = 1000;
 
 const subscriptions = new Map<number, { chatId: number | undefined }>();
@@ -138,7 +165,7 @@ const replyError = (
   id: RpcId | undefined,
   code: RpcErrorCode,
   message: string,
-  data?: string,
+  data?: import("./types").RpcErrorObject["data"],
 ) => {
   if (id !== undefined)
     write({ jsonrpc: "2.0", id, error: { code, message, data } });
@@ -181,8 +208,18 @@ function appendMessage(
   chat: ChatPayload,
   text: string,
   fromMe: boolean,
+  parent?: MessagePayload,
+  ownedGuid?: string,
 ): MessagePayload {
   const message = makeMessage(nextRowid++, chat, text, { fromMe });
+  if (ownedGuid) message.guid = ownedGuid;
+  if (parent) {
+    message.reply_to_guid = parent.guid;
+    message.thread_originator_guid =
+      parent.thread_originator_guid ?? parent.guid;
+    message.reply_to_text = parent.text;
+    message.reply_to_sender = parent.sender;
+  }
   messages.push(message);
   chat.last_message_at = message.created_at;
   emit(message);
@@ -228,12 +265,165 @@ function resolveSendTarget(
 function handle(request: MockRequest): void {
   const { id, method } = request;
   const params = request.params ?? {};
+  const schema = schemas[method ?? ""];
+  if (schema) {
+    const checked = schema.safeParse(params);
+    if (!checked.success) {
+      replyError(
+        id,
+        RpcErrorCode.InvalidParams,
+        "Invalid params",
+        checked.error.message,
+      );
+      return;
+    }
+  }
   switch (method) {
+    case "initialize":
+    case "status": {
+      reply(id, {
+        version: "0.17.0",
+        protocol_version: 1,
+        database: {
+          path: "/mock/chat.db",
+          ready: true,
+          features: {
+            unread_state: true,
+            scheduled_messages: true,
+            reactions: true,
+            reply_context: true,
+            routing_metadata: true,
+            balloon_payloads: true,
+          },
+        },
+        bridge: {
+          ready: true,
+          bridge_version: 2,
+          v2_ready: true,
+          registry_available: true,
+          selectors: {
+            sendMessage: true,
+            sendAttachment: true,
+            urlPreviewMessage: true,
+            sendRichLinkAction: true,
+          },
+        },
+        contacts: { available: true },
+        methods: Object.keys(schemas).filter((m) => !denied.has(m)),
+        supported_methods: Object.keys(schemas),
+      });
+      return;
+    }
+    case "chats.get": {
+      const chat = chatById(num(params, "chat_id"));
+      if (!chat) {
+        replyError(
+          id,
+          RpcErrorCode.InvalidParams,
+          "Invalid params",
+          `Chat not found: ${params["chat_id"]}`,
+        );
+        return;
+      }
+      const info = {
+        id: chat.id,
+        identifier: chat.identifier,
+        guid: chat.guid,
+        name: chat.name,
+        service: chat.service,
+        is_group: chat.is_group,
+        participants: chat.participants,
+      };
+      reply(id, info);
+      return;
+    }
+    case "messages.search": {
+      const query = (str(params, "query") ?? "").toLowerCase();
+      reply(id, {
+        messages: messages
+          .filter((m) =>
+            params["match"] === "exact"
+              ? m.text.toLowerCase() === query
+              : m.text.toLowerCase().includes(query),
+          )
+          .sort((a, b) => b.id - a.id)
+          .slice(0, num(params, "limit") ?? 50)
+          .map((m) => ({ ...m, attachments: [] })),
+      });
+      return;
+    }
+    case "messages.after": {
+      const since = num(params, "since_rowid") ?? 0;
+      const all = messages
+        .filter(
+          (m) =>
+            m.id > since &&
+            (params["chat_id"] === undefined ||
+              m.chat_id === params["chat_id"]),
+        )
+        .sort((a, b) => a.id - b.id);
+      const rows = all.slice(0, num(params, "limit") ?? 100);
+      reply(id, {
+        messages: rows,
+        next_rowid: rows.at(-1)?.id ?? since,
+        has_more: rows.length < all.length,
+      });
+      return;
+    }
+    case "messages.scheduled": {
+      reply(id, {
+        messages: [
+          {
+            id: 800,
+            guid: "SCHEDULED-800",
+            chat_id: 1,
+            chat_identifier: chats[0]!.identifier,
+            chat_guid: chats[0]!.guid,
+            chat_name: "Ada",
+            text: "Tomorrow",
+            service: "iMessage",
+            scheduled_at: "2099-01-01T12:00:00.000Z",
+            schedule_type: 1,
+            schedule_state: 1,
+          },
+        ].slice(0, num(params, "limit") ?? 50),
+      });
+      return;
+    }
+    case "messages.stats": {
+      const chatId = num(params, "chat_id");
+      if (chatId !== undefined && !chatById(chatId)) {
+        replyError(
+          id,
+          RpcErrorCode.InvalidParams,
+          "Invalid params",
+          "unknown chat_id",
+        );
+        return;
+      }
+      const rows = messages.filter(
+        (m) => chatId === undefined || m.chat_id === chatId,
+      );
+      reply(id, {
+        total_messages: rows.length,
+        sent_messages: rows.filter((m) => m.is_from_me).length,
+        received_messages: rows.filter((m) => !m.is_from_me).length,
+        time_zone: str(params, "time_zone") ?? "UTC",
+        chats: [],
+        senders: [],
+        services: [],
+        dates: [],
+        ...(params["include_media"] ? { media: { total_attachments: 0 } } : {}),
+      });
+      return;
+    }
     case "chats.list": {
       const limit = num(params, "limit") ?? 20;
-      const sorted = [...chats].sort((a, b) =>
-        b.last_message_at.localeCompare(a.last_message_at),
-      );
+      const sorted = chats
+        .filter(
+          (chat) => !params["unread_only"] || (chat.unread_count ?? 0) > 0,
+        )
+        .sort((a, b) => b.last_message_at.localeCompare(a.last_message_at));
       reply(id, { chats: sorted.slice(0, Math.max(1, limit)) });
       return;
     }
@@ -270,7 +460,7 @@ function handle(request: MockRequest): void {
       const doomed = chatId === DOOMED_CHAT_ID;
       if (!doomed) subscriptions.set(subscription, { chatId });
       reply(id, { subscription });
-      if (sinceRowid !== undefined) {
+      if (sinceRowid !== undefined && sinceRowid !== 0) {
         for (const message of messages) {
           if (
             message.id > sinceRowid &&
@@ -287,6 +477,19 @@ function handle(request: MockRequest): void {
           params: { subscription, error: { message: "stream died" } },
         });
       }
+      if (process.argv.includes("--overflow")) {
+        subscriptions.delete(subscription);
+        write({
+          jsonrpc: "2.0",
+          method: "watch.overflow",
+          params: {
+            subscription,
+            resume_after_rowid: 102,
+            reason: "buffer_limit_exceeded",
+            terminal: true,
+          },
+        });
+      }
       return;
     }
 
@@ -296,9 +499,56 @@ function handle(request: MockRequest): void {
       return;
     }
 
-    case "send": {
+    case "send":
+    case "send.tracked":
+    case "send.rich":
+    case "send.attachment":
+    case "send.sticker":
+    case "send.multipart": {
       const text = str(params, "text") ?? "";
+      const attempt =
+        method === "send.tracked"
+          ? str(params, "attempt_id")!.toLowerCase()
+          : undefined;
+      if (attempt && messages.some((m) => m.guid.toLowerCase() === attempt)) {
+        replyError(
+          id,
+          RpcErrorCode.InvalidParams,
+          "Invalid params",
+          "attempt_id already identifies a message",
+        );
+        return;
+      }
       if (text === "__crash__") process.exit(3);
+      if (text === "__internal__") {
+        replyError(
+          id,
+          RpcErrorCode.InternalError,
+          "Internal error",
+          "untyped transport failure",
+        );
+        return;
+      }
+      if (text === "__unsafe__" || text === "__inflight__") {
+        replyError(
+          id,
+          text === "__inflight__"
+            ? RpcErrorCode.MutationBlocked
+            : RpcErrorCode.DeliveryUnknown,
+          "Delivery outcome unknown",
+          {
+            retry_safe: false,
+            disposition:
+              text === "__inflight__"
+                ? "still_in_flight"
+                : "may_have_completed",
+            transport: "bridge_v2",
+            operation: "sendMessage",
+            detail: "mock delivery cannot be proved",
+          },
+        );
+        return;
+      }
       const chat = resolveSendTarget(params);
       if (!chat) {
         replyError(
@@ -309,15 +559,45 @@ function handle(request: MockRequest): void {
         );
         return;
       }
-      const message = appendMessage(chat, text, true);
+      const body =
+        method === "send.multipart"
+          ? (params["parts"] as { text: string }[])
+              .map((p) => p.text)
+              .join("\n")
+          : (str(params, "url") ?? text);
+      const replyTo = str(params, "reply_to")?.replace(/^p:\d+\//, "");
+      const parent =
+        replyTo === undefined
+          ? undefined
+          : messages.find((m) => m.guid === replyTo && m.chat_id === chat.id);
+      if (replyTo !== undefined && !parent) {
+        replyError(
+          id,
+          RpcErrorCode.InvalidParams,
+          "Invalid params",
+          "unknown reply target",
+        );
+        return;
+      }
+      const message = appendMessage(chat, body, true, parent, attempt);
       const result: SendResult = {
         ok: true,
-        transport: "applescript",
+        ...(attempt ? { attempt_id: attempt } : {}),
+        transport:
+          method === "send" && params["transport"] !== "bridge"
+            ? "applescript"
+            : "bridge",
         id: message.id,
         guid: message.guid,
         message_id: message.guid,
         chat_guid: chat.guid,
         service: chat.service,
+        ...(method === "send.multipart"
+          ? { parts_count: (params["parts"] as unknown[]).length }
+          : {}),
+        ...(method === "send.sticker"
+          ? { transfer_guid: `TRANSFER-${message.id}` }
+          : {}),
       };
       reply(id, result);
       return;
@@ -361,6 +641,199 @@ function handle(request: MockRequest): void {
     }
 
     default:
+      if (method && Object.hasOwn(actionSchemas, method)) {
+        if (method === "handles.check") {
+          reply(id, {
+            ok: true,
+            address: params["address"],
+            alias_type:
+              str(params, "alias_type") ??
+              (String(params["address"]).includes("@") ? "email" : "phone"),
+            service: "iMessage",
+            available: true,
+          });
+          return;
+        }
+        if (method === "chats.create") {
+          const row = nextRowid++;
+          const chat: ChatPayload = {
+            id: row,
+            identifier: `chat${row}`,
+            guid: `iMessage;+;chat${row}`,
+            name: str(params, "name") ?? "",
+            service: "iMessage",
+            last_message_at: new Date().toISOString(),
+            participants: params["addresses"] as string[],
+            is_group: true,
+            unread_count: 0,
+          };
+          chats.push(chat);
+          if (params["text"]) appendMessage(chat, String(params["text"]), true);
+          reply(id, { ok: true, chat_guid: chat.guid, service: "iMessage" });
+          return;
+        }
+        const chat = resolveSendTarget(params);
+        if (!chat) {
+          replyError(
+            id,
+            RpcErrorCode.InvalidParams,
+            "Invalid params",
+            "unknown chat_id",
+          );
+          return;
+        }
+        if (method.startsWith("group.") && !chat.is_group) {
+          replyError(
+            id,
+            RpcErrorCode.InvalidParams,
+            "Invalid params",
+            "group chat required",
+          );
+          return;
+        }
+        const guid = str(params, "message_id") ?? str(params, "message_guid");
+        const message =
+          guid === undefined
+            ? undefined
+            : messages.find((m) => m.guid === guid && m.chat_id === chat.id);
+        if (guid !== undefined && !message) {
+          replyError(
+            id,
+            RpcErrorCode.InvalidParams,
+            "Invalid params",
+            "unknown message target",
+          );
+          return;
+        }
+        if (method.startsWith("poll.") && method !== "poll.send") {
+          const poll = messages.find(
+            (m) => m.guid === params["poll_guid"] && m.chat_id === chat.id,
+          )?.poll;
+          const option = poll?.options?.find(
+            (o, i) =>
+              o.id === params["option_id"] ||
+              i + 1 === params["option_index"] ||
+              o.text.toLowerCase() === str(params, "option")?.toLowerCase(),
+          );
+          if (!option) {
+            replyError(
+              id,
+              RpcErrorCode.InvalidParams,
+              "Invalid params",
+              "unknown poll option",
+            );
+            return;
+          }
+          const selected = poll!.votes ?? [];
+          if (
+            method === "poll.unvote" &&
+            !selected.some(
+              (v) => v.option_id === option.id && v.participant === "me",
+            )
+          ) {
+            replyError(
+              id,
+              RpcErrorCode.InvalidParams,
+              "Invalid params",
+              "option not currently selected",
+            );
+            return;
+          }
+          poll!.votes = selected.filter(
+            (v) => v.option_id !== option.id || v.participant !== "me",
+          );
+          if (method === "poll.vote")
+            poll!.votes.push({
+              option_id: option.id,
+              option_text: option.text,
+              participant: "me",
+            });
+        }
+        if (method === "poll.send") {
+          const created = appendMessage(chat, "", true);
+          created.poll = {
+            kind: "created",
+            event: "imessage.poll.created",
+            poll_guid: created.guid,
+            question: String(params["question"]),
+            options: (params["options"] as string[]).map((text, i) => ({
+              id: `opt-${i + 1}`,
+              text,
+            })),
+          };
+          reply(id, {
+            ok: true,
+            event: created.poll.event,
+            guid: created.guid,
+            message_id: created.guid,
+            poll: created.poll,
+            comment: {
+              requested: !params["suppress_comment"],
+              sent: !params["suppress_comment"],
+              verified: !params["suppress_comment"],
+            },
+          });
+          return;
+        }
+        if (method === "read") {
+          chat.unread_count = 0;
+          messages
+            .filter((m) => m.chat_id === chat.id && !m.is_from_me)
+            .forEach((m) => {
+              m.is_read = true;
+            });
+        }
+        if (method === "chats.markUnread")
+          chat.unread_count = Math.max(1, chat.unread_count ?? 0);
+        if (method === "chats.delete") {
+          chats.splice(chats.indexOf(chat), 1);
+          for (let i = messages.length - 1; i >= 0; i--)
+            if (messages[i]!.chat_id === chat.id) messages.splice(i, 1);
+        }
+        if (method === "group.rename") chat.name = String(params["name"]);
+        if (
+          method === "group.addParticipant" &&
+          !chat.participants.includes(String(params["address"]))
+        )
+          chat.participants.push(String(params["address"]));
+        if (method === "group.removeParticipant")
+          chat.participants = chat.participants.filter(
+            (p) => p !== params["address"],
+          );
+        if (method === "message.edit" && message)
+          message.text = String(params["text"]);
+        if (["message.delete", "message.unsend"].includes(method) && message)
+          messages.splice(messages.indexOf(message), 1);
+        if (method === "tapback" && message) {
+          if (
+            params["remove"] ||
+            String(params["reaction"]).startsWith("remove-")
+          )
+            message.reactions = message.reactions.filter((r) => !r.is_from_me);
+          else
+            message.reactions.push({
+              id: nextRowid++,
+              type: String(params["reaction"]).replace(
+                "emphasize",
+                "emphasis",
+              ) as import("./types").ReactionName,
+              emoji: "",
+              sender: "me",
+              is_from_me: true,
+              created_at: new Date().toISOString(),
+            });
+        }
+        reply(id, {
+          ok: true,
+          ...(method === "contacts.shouldShareContact"
+            ? { can_inspect_offer: true, can_share: true, should_offer: null }
+            : {}),
+          ...(method === "contacts.shareContactCard"
+            ? { requested: true }
+            : {}),
+        });
+        return;
+      }
       replyError(
         id,
         RpcErrorCode.MethodNotFound,
@@ -369,6 +842,166 @@ function handle(request: MockRequest): void {
       );
   }
 }
+
+const integer = z.number().int().min(0).max(Number.MAX_SAFE_INTEGER);
+const positive = integer.positive();
+const targetFields = {
+  chat_id: positive.optional(),
+  chat_guid: z.string().min(1).optional(),
+  chat_identifier: z.string().min(1).optional(),
+};
+const formats = z.array(
+  z
+    .object({
+      start: integer,
+      length: positive,
+      styles: z.array(z.enum(["bold", "italic", "underline", "strikethrough"])),
+    })
+    .strict(),
+);
+const targetSchema = <T extends z.ZodRawShape>(extra: T, direct = false) =>
+  z
+    .object({
+      ...targetFields,
+      ...(direct ? { to: z.string().min(1).optional() } : {}),
+      ...extra,
+    })
+    .strict()
+    .refine(
+      (p) =>
+        [
+          "chat_id",
+          "chat_guid",
+          "chat_identifier",
+          ...(direct ? ["to"] : []),
+        ].filter((k) => (p as Record<string, unknown>)[k] !== undefined)
+          .length === 1,
+    );
+const schemas: Record<string, z.ZodType> = {
+  ...actionSchemas,
+  "send.tracked": targetSchema(
+    {
+      text: z.string().trim().min(1),
+      attempt_id: z.uuid(),
+      service: z.enum(["auto", "imessage", "sms"]).optional(),
+      transport: z.literal("bridge").optional(),
+      allow_sms_fallback: z.literal(false).optional(),
+    },
+    true,
+  ),
+  status: z.object({}).strict(),
+  initialize: z.object({ protocol_version: z.literal(1).optional() }).strict(),
+  "chats.list": z
+    .object({ limit: positive.optional(), unread_only: z.boolean().optional() })
+    .strict(),
+  "chats.get": z.object({ chat_id: positive }).strict(),
+  "messages.search": z
+    .object({
+      query: z.string().trim().min(1),
+      match: z.enum(["contains", "exact"]).optional(),
+      limit: positive.max(100).optional(),
+    })
+    .strict(),
+  "messages.after": z
+    .object({
+      since_rowid: integer,
+      chat_id: positive.optional(),
+      limit: positive.max(500).optional(),
+      attachments: z.boolean().optional(),
+      convert_attachments: z.boolean().optional(),
+      include_reactions: z.boolean().optional(),
+    })
+    .strict(),
+  "messages.history": z
+    .object({
+      chat_id: positive,
+      limit: positive.optional(),
+      start: z.string().optional(),
+      end: z.string().optional(),
+      participants: z.array(z.string()).optional(),
+      attachments: z.boolean().optional(),
+      convert_attachments: z.boolean().optional(),
+    })
+    .strict(),
+  "messages.scheduled": z.object({ limit: positive.optional() }).strict(),
+  "messages.stats": z
+    .object({
+      chat_id: positive.optional(),
+      time_zone: z.string().optional(),
+      include_media: z.boolean().optional(),
+    })
+    .strict(),
+  "watch.subscribe": z
+    .object({
+      chat_id: positive.optional(),
+      since_rowid: z.number().int().min(-1).optional(),
+      attachments: z.boolean().optional(),
+      convert_attachments: z.boolean().optional(),
+      include_reactions: z.boolean().optional(),
+      buffer_limit: positive.max(4096).optional(),
+      debounce_ms: integer.optional(),
+      start: z.string().optional(),
+      end: z.string().optional(),
+      participants: z.array(z.string()).optional(),
+    })
+    .strict(),
+  "watch.unsubscribe": z.object({ subscription: positive }).strict(),
+  send: targetSchema(
+    {
+      text: z.string().optional(),
+      file: z.string().optional(),
+      service: z.enum(["auto", "imessage", "sms"]).optional(),
+      allow_sms_fallback: z.boolean().optional(),
+      reply_to: z.string().optional(),
+      text_formatting: formats.optional(),
+      transport: z.enum(["auto", "bridge", "applescript"]).optional(),
+      region: z.string().optional(),
+    },
+    true,
+  ).refine((p) => Boolean(p["text"] || p["file"])),
+  "send.rich": targetSchema({
+    text: z.string().optional(),
+    file: z.string().optional(),
+    url: z.url().optional(),
+    reply_to: z.string().optional(),
+    subject: z.string().optional(),
+    effect_id: z.string().optional(),
+    text_formatting: formats.optional(),
+  }),
+  "send.attachment": targetSchema({
+    file: z.string().min(1),
+    audio: z.boolean().optional(),
+    reply_to: z.string().optional(),
+    part_index: integer.optional(),
+  }),
+  "send.sticker": targetSchema({
+    file: z.string().min(1),
+    attach_to: z.string().optional(),
+    part_index: integer.optional(),
+  }),
+  "send.multipart": targetSchema({
+    parts: z
+      .array(
+        z
+          .object({
+            text: z.string().min(1),
+            text_formatting: formats.optional(),
+          })
+          .strict(),
+      )
+      .min(1)
+      .max(20),
+    subject: z.string().optional(),
+    effect_id: z.string().optional(),
+  }),
+  "message.send_status": z.object({ guid: z.string().min(1) }).strict(),
+  "group.setIcon": targetSchema({ file: z.string().optional() }),
+};
+const denied = new Set(
+  process.argv
+    .filter((arg) => arg.startsWith("--deny="))
+    .map((arg) => arg.slice(7)),
+);
 
 const intervalIndex = process.argv.indexOf("--interval");
 const intervalMs =

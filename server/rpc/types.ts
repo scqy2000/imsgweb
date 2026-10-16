@@ -1,6 +1,6 @@
 /**
  * Wire types for `imsg rpc` — JSON-RPC 2.0, one JSON object per line over
- * stdio. Matches the pinned `imsg/` submodule (v0.11.1); upstream schema
+ * stdio. Matches the public imsg v0.17.0 contract; upstream schema
  * changes are additive-only, so treat unknown fields as ignorable.
  *
  * Everything on the wire is snake_case. Dates are ISO-8601 UTC with
@@ -24,13 +24,24 @@ export type RpcResponse<M extends ImsgMethod = ImsgMethod> =
   | { jsonrpc: "2.0"; id: RpcId; result: ImsgRpcMethods[M]["result"] }
   | { jsonrpc: "2.0"; id: RpcId | null; error: RpcErrorObject };
 
-export type RpcNotification = WatchMessageNotification | WatchErrorNotification;
+export type RpcNotification =
+  | WatchMessageNotification
+  | WatchErrorNotification
+  | WatchOverflowNotification;
+
+export interface DeliveryErrorData {
+  retry_safe: boolean;
+  disposition: "not_started" | "may_have_completed" | "still_in_flight";
+  transport: string;
+  operation: string;
+  detail: string;
+}
 
 export interface RpcErrorObject {
   code: RpcErrorCode;
   /** Fixed label per code; the human-readable detail is in `data`. */
   message: string;
-  data?: string;
+  data?: string | DeliveryErrorData;
 }
 
 export const RpcErrorCode = {
@@ -41,6 +52,11 @@ export const RpcErrorCode = {
   InvalidParams: -32602,
   /** Internal failures, including "bridge not injected". */
   InternalError: -32603,
+  ServerBusy: -32000,
+  DeliveryUnknown: -32001,
+  DatabaseUnavailable: -32002,
+  BridgeUnavailable: -32003,
+  MutationBlocked: -32004,
 } as const;
 export type RpcErrorCode = (typeof RpcErrorCode)[keyof typeof RpcErrorCode];
 
@@ -125,6 +141,11 @@ export type ChatTarget = DirectTarget | ExistingChatTarget;
 /* ── Payload objects (server → client) ───────────────────────────────────── */
 
 export interface ChatPayload {
+  display_name?: string;
+  unread_count?: number;
+  account_id?: string;
+  account_login?: string;
+  last_addressed_handle?: string;
   /** chat.db ROWID. */
   id: number;
   identifier: string;
@@ -212,6 +233,18 @@ export interface PollVote {
 
 /** Message as returned by `messages.history` and pushed by watch. */
 export interface MessagePayload {
+  is_read?: boolean;
+  date_read?: string;
+  balloon_bundle_id?: string;
+  url_preview?: {
+    id: number;
+    guid: string;
+    balloon_bundle_id: string;
+    created_at: string;
+  };
+  account_id?: string;
+  account_login?: string;
+  last_addressed_handle?: string;
   /** chat.db ROWID — monotonic; use as the watch resume cursor. Both
    *  history and watch can re-emit a rowid (URL-preview balloon
    *  replacement) — upsert by id, don't append blindly. */
@@ -272,6 +305,7 @@ export interface MessagePayload {
 /* ── Core methods (work with SIP enabled) ────────────────────────────────── */
 
 export interface ChatsListParams {
+  unread_only?: boolean;
   /** Default 20. Most-recent-first. */
   limit?: number;
 }
@@ -301,6 +335,7 @@ export interface MessagesHistoryResult {
 }
 
 export interface WatchSubscribeParams {
+  buffer_limit?: number;
   /** Omit for the all-chats stream. */
   chat_id?: number;
   /** Exclusive resume cursor: deliver rows with ROWID > since_rowid. */
@@ -316,6 +351,7 @@ export interface WatchSubscribeParams {
   debounce_ms?: number;
 }
 export interface WatchSubscribeResult {
+  buffer_limit?: number;
   /** Handle for unsubscribe; echoed on every notification. */
   subscription: number;
 }
@@ -329,7 +365,25 @@ export interface WatchMessageNotification {
 export interface WatchErrorNotification {
   jsonrpc: "2.0";
   method: "error";
-  params: { subscription: number; error: { message: string } };
+  params: {
+    subscription: number;
+    error: {
+      message: string;
+      code?: number;
+      data?: string | DeliveryErrorData;
+    };
+  };
+}
+
+export interface WatchOverflowNotification {
+  jsonrpc: "2.0";
+  method: "watch.overflow";
+  params: {
+    subscription: number;
+    resume_after_rowid: number;
+    reason: string;
+    terminal: true;
+  };
 }
 
 export interface WatchUnsubscribeParams {
@@ -340,6 +394,9 @@ export interface OkResult {
 }
 
 export type SendParams = ChatTarget & {
+  allow_sms_fallback?: boolean;
+  reply_to?: string;
+  text_formatting?: TextFormattingRun[];
   /** At least one of text/file is required. */
   text?: string;
   /** Absolute path. */
@@ -354,7 +411,7 @@ export type SendParams = ChatTarget & {
 };
 export interface SendResult {
   ok: true;
-  transport: "bridge" | "applescript";
+  transport?: "bridge" | "applescript";
   /** chat.db ROWID; best-effort, AppleScript path only. */
   id?: number;
   guid?: string;
@@ -363,6 +420,14 @@ export interface SendResult {
   chat_guid?: string;
   service?: string;
 }
+
+export type SendTrackedParams = ChatTarget & {
+  text: string;
+  attempt_id: string;
+  service?: SendService;
+  transport?: "bridge";
+  allow_sms_fallback?: false;
+};
 
 export interface MessageSendStatusParams {
   guid: string;
@@ -400,6 +465,8 @@ export interface SendStatusFields {
  * of catching errors per call. */
 
 export type SendRichParams = ExistingChatTarget & {
+  file?: string;
+  url?: string;
   text?: string;
   effect_id?: EffectId;
   subject?: string;
@@ -421,6 +488,7 @@ export interface SendRichResult {
 }
 
 export type SendAttachmentParams = ExistingChatTarget & {
+  part_index?: number;
   /** ~ is expanded. */
   file: string;
   /** Send as a native voice message. */
@@ -434,6 +502,8 @@ export interface SendAttachmentResult {
 }
 
 export type PollSendParams = ExistingChatTarget & {
+  comment?: string;
+  suppress_comment?: boolean;
   question: string;
   /** At least 2 non-empty options. */
   options: string[];
@@ -446,15 +516,24 @@ export interface PollSendResult {
   guid?: string;
   message_id?: string;
   poll?: Record<string, unknown>;
+  comment?: {
+    requested: boolean;
+    sent: boolean | null;
+    verified?: boolean;
+    message_guid?: string;
+    error?: string;
+    retry_safe?: boolean;
+    disposition?: DeliveryErrorData["disposition"];
+  };
 }
 
-export type TapbackParams = ExistingChatTarget & {
-  message_id: string;
-  reaction: TapbackInput;
-  /** Alternative to the "remove-" prefix. */
-  remove?: boolean;
-  part_index?: number;
-};
+export type TapbackParams = ExistingChatTarget &
+  MessageTarget & {
+    reaction: TapbackInput;
+    /** Alternative to the "remove-" prefix. */
+    remove?: boolean;
+    part_index?: number;
+  };
 export interface TapbackResult {
   ok: true;
   /** The normalized kind actually sent. */
@@ -475,24 +554,25 @@ export type TypingParams = ChatTarget & {
 export type ReadParams = ChatTarget;
 
 /** Within Apple's edit window. */
-export type MessageEditParams = ExistingChatTarget & {
-  message_id: string;
-  text: string;
-  /** Fallback for clients that can't render edits; defaults to `text`. */
-  backwards_compatibility_message?: string;
-  part_index?: number;
-};
+export type MessageTarget =
+  | { message_id: string; message_guid?: never }
+  | { message_guid: string; message_id?: never };
+export type MessageEditParams = ExistingChatTarget &
+  MessageTarget & {
+    text: string;
+    /** Fallback for clients that can't render edits; defaults to `text`. */
+    backwards_compatibility_message?: string;
+    part_index?: number;
+  };
 /** Within Apple's unsend window. */
-export type MessageUnsendParams = ExistingChatTarget & {
-  message_id: string;
-  part_index?: number;
-};
+export type MessageUnsendParams = ExistingChatTarget &
+  MessageTarget & {
+    part_index?: number;
+  };
 /** Local delete (this device's view only). */
-export type MessageDeleteParams = ExistingChatTarget & { message_id: string };
+export type MessageDeleteParams = ExistingChatTarget & MessageTarget;
 /** Break through Focus/DND for a message. */
-export type MessageNotifyAnywaysParams = ExistingChatTarget & {
-  message_id: string;
-};
+export type MessageNotifyAnywaysParams = ExistingChatTarget & MessageTarget;
 
 /** The only way to create group threads (direct `send` can create 1:1s). */
 export interface ChatsCreateParams {
@@ -545,7 +625,119 @@ export interface HandlesCheckResult {
 
 /* ── Method map ──────────────────────────────────────────────────────────── */
 
+export interface StatusResult {
+  version: string;
+  protocol_version: number;
+  database: {
+    path?: string;
+    ready: boolean;
+    error?: string;
+    features?: Record<string, boolean>;
+  };
+  bridge: {
+    ready: boolean;
+    error?: string;
+    bridge_version?: number;
+    v2_ready?: boolean;
+    registry_available?: boolean;
+    selectors?: Record<string, boolean>;
+  };
+  contacts: { available: boolean };
+  methods: string[];
+  supported_methods: string[];
+}
+export type ChatInfo = Omit<ChatPayload, "last_message_at">;
+export interface ScheduledMessagePayload {
+  id: number;
+  guid: string;
+  chat_id: number;
+  chat_identifier: string;
+  chat_guid: string;
+  chat_name: string;
+  text: string;
+  service: string;
+  scheduled_at: string;
+  schedule_type: number;
+  schedule_state: number;
+}
+export interface StatsResult {
+  total_messages: number;
+  sent_messages: number;
+  received_messages: number;
+  time_zone: string;
+  chats: Record<string, unknown>[];
+  senders: Record<string, unknown>[];
+  services: Record<string, unknown>[];
+  dates: Record<string, unknown>[];
+  media?: Record<string, unknown>;
+}
+export type PollVoteParams = ExistingChatTarget & {
+  poll_guid: string;
+  option_id?: string;
+  option_index?: number;
+  option?: string;
+};
+export type SendMultipartParams = ExistingChatTarget & {
+  parts: Array<{ text: string; text_formatting?: TextFormattingRun[] }>;
+  effect_id?: EffectId;
+  subject?: string;
+};
+export type SendStickerParams = ExistingChatTarget & {
+  file: string;
+  attach_to?: string;
+  part_index?: number;
+};
+
 export interface ImsgRpcMethods {
+  status: { params: Record<string, never>; result: StatusResult };
+  initialize: { params: { protocol_version?: 1 }; result: StatusResult };
+  "chats.get": { params: { chat_id: number }; result: ChatInfo };
+  "messages.search": {
+    params: { query: string; match?: "contains" | "exact"; limit?: number };
+    result: MessagesHistoryResult;
+  };
+  "messages.stats": {
+    params: { chat_id?: number; time_zone?: string; include_media?: boolean };
+    result: StatsResult;
+  };
+  "messages.scheduled": {
+    params: { limit?: number };
+    result: { messages: ScheduledMessagePayload[] };
+  };
+  "messages.after": {
+    params: {
+      since_rowid: number;
+      chat_id?: number;
+      limit?: number;
+      attachments?: boolean;
+      convert_attachments?: boolean;
+      include_reactions?: boolean;
+    };
+    result: MessagesHistoryResult & { next_rowid: number; has_more: boolean };
+  };
+  "send.multipart": {
+    params: SendMultipartParams;
+    result: SendResult & { parts_count: number };
+  };
+  "send.sticker": {
+    params: SendStickerParams;
+    result: SendResult & { transfer_guid: string };
+  };
+  "poll.vote": { params: PollVoteParams; result: OkResult };
+  "poll.unvote": { params: PollVoteParams; result: OkResult };
+  "contacts.shouldShareContact": {
+    params: ExistingChatTarget;
+    result: {
+      ok: boolean;
+      can_inspect_offer: boolean;
+      can_share: boolean;
+      should_offer: boolean | null;
+    };
+  };
+  "contacts.shareContactCard": {
+    params: ExistingChatTarget;
+    result: OkResult & { requested: boolean };
+  };
   /* core */
   "chats.list": { params: ChatsListParams; result: ChatsListResult };
   "messages.history": {
@@ -558,6 +750,14 @@ export interface ImsgRpcMethods {
   };
   "watch.unsubscribe": { params: WatchUnsubscribeParams; result: OkResult };
   send: { params: SendParams; result: SendResult };
+  "send.tracked": {
+    params: SendTrackedParams;
+    result: SendResult & {
+      attempt_id: string;
+      guid: string;
+      message_id: string;
+    };
+  };
   "message.send_status": {
     params: MessageSendStatusParams;
     result: MessageSendStatusResult;

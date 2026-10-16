@@ -1,6 +1,20 @@
 import { expect, test } from "bun:test";
-import { applyReactionEvent, bumpChat, upsertMessage } from "./model";
+import {
+  applyReactionEvent,
+  bumpChat,
+  filterChats,
+  updateEditedMessage,
+  upsertMessage,
+} from "./model";
 import type { ApiChat, ApiMessage } from "../server/payloads";
+
+test("successful edits update cached messages outside the newest history page", () => {
+  const list = [makeMessage(10), makeMessage(200)];
+  const next = updateEditedMessage(list, "G-10", "updated old message");
+  expect(next[0]?.text).toBe("updated old message");
+  expect(next[1]).toBe(list[1]);
+  expect(list[0]?.text).toBe("message 10");
+});
 
 function makeMessage(
   id: number,
@@ -120,4 +134,23 @@ test("bumpChat ignores stale replays and signals unknown chats", () => {
   expect(stale?.[0]?.last_message).toBeNull();
 
   expect(bumpChat(chats, makeMessage(51, { chat_id: 7 }))).toBeNull();
+});
+
+test("conversation filters find participants and honor unread without hiding groups", () => {
+  const chats = [
+    {
+      ...makeChat(1, "2026-06-10T00:00:05.000Z"),
+      unread_count: 3,
+      participants: ["someone@example.com"],
+    },
+    {
+      ...makeChat(2, "2026-06-10T00:00:05.000Z"),
+      unread_count: 0,
+      is_group: true,
+      display_name: "Project",
+    },
+  ];
+  expect(filterChats(chats, "EXAMPLE", false).map((c) => c.id)).toEqual([1]);
+  expect(filterChats(chats, "", true).map((c) => c.id)).toEqual([1]);
+  expect(filterChats(chats, "project", false).map((c) => c.id)).toEqual([2]);
 });

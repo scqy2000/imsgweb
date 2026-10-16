@@ -8,6 +8,34 @@
 import { previewText } from "../server/preview";
 import type { ApiChat, ApiMessage } from "../server/payloads";
 
+export function updateEditedMessage(
+  list: ApiMessage[],
+  guid: string,
+  text: string,
+): ApiMessage[] {
+  return list.map((message) =>
+    message.guid.toLowerCase() === guid.toLowerCase()
+      ? { ...message, text }
+      : message,
+  );
+}
+
+export function filterChats(
+  chats: ApiChat[],
+  query: string,
+  unreadOnly: boolean,
+): ApiChat[] {
+  const needle = query.trim().toLocaleLowerCase();
+  return chats.filter(
+    (chat) =>
+      (!unreadOnly || (chat.unread_count ?? 0) > 0) &&
+      (!needle ||
+        [chat.display_name, chat.identifier, ...chat.participants].some(
+          (value) => value.toLocaleLowerCase().includes(needle),
+        )),
+  );
+}
+
 /** Insert or replace by id, keeping the list sorted by id (oldest first). */
 export function upsertMessage(
   list: ApiMessage[],

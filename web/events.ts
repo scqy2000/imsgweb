@@ -14,10 +14,16 @@ export interface EventsHandle {
 export function connectEvents(handlers: {
   onMessage: (message: ApiMessage) => void;
   onStateChange: (live: boolean) => void;
+  onReset?: () => void;
 }): EventsHandle {
   const source = new EventSource("/api/events");
   source.addEventListener("open", () => handlers.onStateChange(true));
   source.addEventListener("error", () => handlers.onStateChange(false));
+  source.addEventListener("reset", () => handlers.onReset?.());
+  source.addEventListener("watch.overflow", () => {
+    handlers.onStateChange(false);
+    handlers.onReset?.();
+  });
   source.addEventListener("message", (event) => {
     // receiving data proves the stream is live even if `open` was missed
     handlers.onStateChange(true);
